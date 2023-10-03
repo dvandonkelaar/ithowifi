@@ -502,27 +502,142 @@ void mqttHomeAssistantDiscovery()
   sendHomeAssistantDiscovery = false;
   I_LOG("HA DISCOVERY: Start publishing MQTT Home Assistant Discovery...");
 
-  JsonDocument configDoc;
-  JsonObject configObj = configDoc.to<JsonObject>();
+  HADiscoveryFan();
 
-  haDiscConfig.get(configObj);
+  if (!SHT3x_original && !SHT3x_alternative && !itho_internal_hum_temp)
+    return;
+  HADiscoveryHumidity();
+  HADiscoveryTemperature();
+}
 
-  JsonDocument outputDoc;
-  JsonObject outputObj = outputDoc.to<JsonObject>();
+void HADiscoveryFan()
+{
+  DynamicJsonDocument doc(2048);
+  JsonObject root = doc.to<JsonObject>(); // Fill the object
+  char s[160]{};
 
-  generateHADiscoveryJson(configObj, outputObj);
+  addHADevInfo(root);
+  root["avty_t"] = (const char *)systemConfig.mqtt_lwt_topic;
+  snprintf(s, sizeof(s), "%s_fan", hostName());
+  root["uniq_id"] = s;
+  root["name"] = s;
+  root["stat_t"] = (const char *)systemConfig.mqtt_state_topic;
+  root["stat_val_tpl"] = "{% if (value | int) > 0 %}ON{% else %}OFF{% endif %}";
+  root["json_attr_t"] = (const char *)systemConfig.mqtt_ithostatus_topic;
+  root["cmd_t"] = (const char *)systemConfig.mqtt_cmd_topic;
+  root["cmd_tpl"] = "{% if value == 'OFF' %}{ 'speed':'0' }{% else %}{ 'command':'low' }{% endif %}";
+  root["pct_cmd_t"] = (const char *)systemConfig.mqtt_cmd_topic;
+  root["pct_cmd_tpl"] = "{{ value * 2.54 }}";
+  root["pct_stat_t"] = (const char *)systemConfig.mqtt_state_topic;
+  root["pct_val_tpl"] = "{{ ((value | int)*100/255) | round(0) }}";
+  root["pr_mode_stat_t"] = (const char *)systemConfig.mqtt_state_topic;
+  root["pr_mode_val_tpl"] =
+    "{%- set valuepct = 100*(value | int)/255|round(0) %}"
+    "{%- if valuepct >= 20 and valuepct <= 27 %}Low"
+    "{%- elif valuepct >= 46 and valuepct <= 53 %}Medium"
+    "{%- elif valuepct >= 77 and valuepct <= 83 %}High"
+    "{%- elif valuepct >= 97 %}Max{% endif -%}";
+  root["pr_mode_cmd_t"] = (const char *)systemConfig.mqtt_cmd_topic;
+  root["pr_mode_cmd_tpl"] =
+    "{%- if value == 'Low' %}{{(25*255/100)|round(0)}}"
+    "{%- elif value == 'Medium' %}{{(50*255/100)|round(0)}}"
+    "{%- elif value == 'High' %}{{(80*255/100)|round(0)}}"
+    "{%- elif value == 'Max' %}{{(100*255/100)|round(0)}}"
+    "{%- endif -%}";
 
-  // config doc is no longer needed, manually clear memory before next step
-  configDoc.clear();
+  JsonArray pr_modes = root.createNestedArray("pr_modes");
+  pr_modes.add("Low");
+  pr_modes.add("Medium");
+  pr_modes.add("High");
+  pr_modes.add("Max");
 
-  char devicetopic[160]{};
+  snprintf(s, sizeof(s), "%s/fan/%s/config", (const char *)systemConfig.mqtt_ha_topic, hostName());
 
-  snprintf(devicetopic, sizeof(devicetopic), "%s%s%s%s", systemConfig.mqtt_ha_topic, "/device/", hostName(), "/config");
+  sendHADiscovery(root, s);
+}
 
-  if (outputDoc.overflowed())
-    E_LOG("generateHADiscoveryJson overflowed!");
+void HADiscoveryTemperature()
+{
+  DynamicJsonDocument doc(2048);
+  JsonObject root = doc.to<JsonObject>(); // Fill the object
+  char s[160]{};
 
-  MQTTSendBuffered(outputDoc, devicetopic);
+  addHADevInfo(root);
+  root["avty_t"] = static_cast<const char *>(systemConfig.mqtt_lwt_topic);
+  root["dev_cla"] = "temperature";
+  snprintf(s, sizeof(s), "%s_temperature", hostName());
+  root["uniq_id"] = s;
+  root["name"] = s;
+  root["stat_t"] = static_cast<const char *>(systemConfig.mqtt_ithostatus_topic);
+  root["stat_cla"] = "measurement";
+  root["val_tpl"] = "{{ value_json.temp }}";
+  root["unit_of_meas"] = "°C";
+
+  snprintf(s, sizeof(s), "%s/sensor/%s/temp/config", static_cast<const char *>(systemConfig.mqtt_ha_topic), hostName());
+
+  sendHADiscovery(root, s);
+}
+
+void HADiscoveryHumidity()
+{
+  DynamicJsonDocument doc(2048);
+  JsonObject root = doc.to<JsonObject>(); // Fill the object
+  char s[160]{};
+
+  addHADevInfo(root);
+  root["avty_t"] = static_cast<const char *>(systemConfig.mqtt_lwt_topic);
+  root["dev_cla"] = "humidity";
+  snprintf(s, sizeof(s), "%s_humidity", hostName());
+  root["uniq_id"] = s;
+  root["name"] = s;
+  root["stat_t"] = static_cast<const char *>(systemConfig.mqtt_ithostatus_topic);
+  root["stat_cla"] = "measurement";
+  root["val_tpl"] = "{{ value_json.hum }}";
+  root["unit_of_meas"] = "%";
+
+  snprintf(s, sizeof(s), "%s/sensor/%s/hum/config", static_cast<const char *>(systemConfig.mqtt_ha_topic), hostName());
+
+  sendHADiscovery(root, s);
+}
+
+void addHADevInfo(JsonObject obj)
+{
+  char s[64]{};
+  JsonObject dev = obj.createNestedObject("dev");
+  dev["identifiers"] = hostName();
+  dev["manufacturer"] = "Arjen Hiemstra";
+  dev["model"] = "ITHO Wifi Add-on";
+  snprintf(s, sizeof(s), "ITHO-WIFI(%s)", hostName());
+  dev["name"] = s;
+  dev["hw_version"] = hw_revision;
+  dev["sw_version"] = FWVERSION;
+}
+
+void sendHADiscovery(JsonObject obj, const char *topic)
+{
+  size_t payloadSize = measureJson(obj);
+  // max header + topic + content. Copied logic from PubSubClien::publish(), PubSubClient.cpp:482
+  size_t packetSize = MQTT_MAX_HEADER_SIZE + 2 + strlen(topic) + payloadSize;
+
+  if (mqttClient.getBufferSize() < packetSize)
+  {
+    E_LOG("MQTT: buffer too small, resizing... (HA discovery)");
+    mqttClient.setBufferSize(packetSize);
+  }
+
+  if (mqttClient.beginPublish(topic, payloadSize, true))
+  {
+    serializeJson(obj, mqttClient);
+    if (!mqttClient.endPublish())
+      E_LOG("MQTT: Failed to send payload (HA discovery)");
+  }
+  else
+  {
+    E_LOG("MQTT: Failed to start building message (HA discovery)");
+  }
+
+  // reset buffer
+  mqttClient.setBufferSize(MQTT_BUFFER_SIZE);
 }
 
 bool setupMQTTClient()
